@@ -1,6 +1,8 @@
-# Goal: smallest bootable x86 image that serves a static file over HTTPS
+# Goal: most simultaneous HTTPS connections per KiB of bootable x86 image
 
-Minimize the byte size of `build/os.bin` while `./measure.sh` keeps passing.
+Maximize the score from `./score.sh`: connections / (size of `build/os.bin` / 1024), where
+connections = the most TLS connections that were open at the same time and all served the page.
+`./measure.sh` must keep passing. (Until 2026-11-08 the goal was size alone: 2,714 bytes.)
 Security does not matter. Correctness for real clients (curl, Chrome, Firefox) does.
 
 ## Commands
@@ -8,6 +10,12 @@ Security does not matter. Correctness for real clients (curl, Chrome, Firefox) d
   and a listing `build/os.lst`; `python3 tools/sizes.py build/os.lst` = bytes per routine
 - `./measure.sh` builds, boots it in QEMU (TCG, no KVM here), fetches it with curl
   (fresh connections + keep-alive), prints PASS + size + largest routines
+- `./score.sh [image] [max]` boots the image and runs `tools/load.py hold`: opens TLS
+  connections (32 handshakes in flight, starts 4 ms apart because slirp's listen backlog is 1),
+  keeps them all open, fetches the page over every one at 64, 128, 256, ... open and at the
+  end; stops at the first failing checkpoint, at `max`, or when the client runs out of ports
+  (~28K: Linux's ephemeral range). Takes minutes at full scale. `tools/load.py` also has
+  `burst K` (K clients at the same moment), `seq N` (handshake rate) and `ka N` (keep-alive).
 - `./browsers.sh` checks Chrome (cert errors must be bypassable, page renders) and
   Firefox (`tools/ffcheck.py`, Marionette, cert exception in a throwaway profile).
   Run after any TLS/cert/TCP/HTTP change.
