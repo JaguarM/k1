@@ -49,7 +49,8 @@ Change `www/index.html` to serve something else.
   shared secret X25519(client key, 9) is simply the client's own key share.
 - The certificate has no signature. Its issuer name differs from its (empty) subject, so
   clients look for the issuer, don't find it, report "unknown issuer" (which you can click
-  through) and never check the signature. Its key is the d = 1/r above.
+  through) and never check the signature, whose "algorithm" is therefore just a 2-byte OID.
+  Its key is the d = 1/r above.
 - Poly1305 multiplies with 8-bit limbs, as 17 column sums over a precomputed table.
 - The SHA-256 constants are computed at boot from their definition (cube roots of primes,
   by Newton's method on the x87 FPU) instead of being stored.
