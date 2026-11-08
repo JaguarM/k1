@@ -187,6 +187,8 @@ tcp:
         xor ebx, ebx            ; FR
         cmp byte [ebx+13], 0    ; IPv4 only (slirp also sends ARP and IPv6)
         jne nsret
+        cmp byte [ebx+23], 6    ; tap: TCP only (a real host also sends IGMP, ICMP, UDP)
+        jne nsret
         movzx eax, byte [ebx+46]
         shr eax, 2              ; TCP header length
         movzx ecx, word [ebx+16]
@@ -196,6 +198,12 @@ tcp:
         lea esi, [ebx+eax+34]
         mov ebp, [ebx+33]       ; 15 (our IP's last byte) | client port | 1 (443 >> 8)
         shr ebp, 1              ; connection slot: CONNS + 7 + port (bytes swapped) * 128
+%ifndef NOIP
+        movzx eax, byte [ebx+29] ; tap: client IP's low nibble picks one of 16 x 8 MiB tables
+        and al, 15
+        shl eax, 23
+        add ebp, eax
+%endif
         mov dl, [ebx+47]        ; flags
         mov eax, [ebx+42]
         xchg eax, [ebx+38]      ; our seq = their ack; eax = their seq
@@ -221,6 +229,12 @@ tcp:
         xchg eax, [ebx+30]
         mov [ebx+26], eax       ; swap IP addresses
         rol dword [ebx+34], 16  ; swap ports
+        mov eax, [ebx]          ; tap: swap MACs (a real host drops frames not addressed to it)
+        xchg eax, [ebx+6]
+        mov [ebx], eax
+        mov ax, [ebx+4]
+        xchg ax, [ebx+10]
+        mov [ebx+4], ax
         mov edi, OB             ; edi = end of our output
         push edi
         cmp [ebp+C_ST], ebx
