@@ -7,14 +7,16 @@
                         over every open connection. Stops at the first checkpoint where any
                         connection fails, at N, or when the client runs out of ports.
                         Prints "connections: C" = most connections that all worked at once.
-                        PORTS=lo-hi binds each connection to the next free source port in that
-                        range instead of letting the kernel pick from its ephemeral range.
+                        PORTS=1024-32767,61000-65535,auto binds each connection to the next free
+                        source port of those ranges, then lets the kernel pick ("auto", the
+                        default); bind explicitly only outside the kernel's ephemeral range, or
+                        every other program on the host runs out of ports.
   load.py burst K[,K..] K clients connect at the same moment, each fetches the page, all stay
                         open, then each fetches it again over the same connection
   load.py seq N         N fresh connections, one after another (handshake rate)
   load.py ka N          N requests on one keep-alive connection
 """
-import asyncio, collections, errno, os, ssl, sys, time
+import asyncio, collections, errno, os, socket, ssl, struct, sys, time
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8443"))
@@ -65,8 +67,12 @@ async def get(conn):
 
 
 def close(conns):
+    """Reset rather than close: tens of thousands of TIME-WAIT sockets on explicitly bound
+    ports would keep those ports (8443 included) unusable on this host for a minute."""
     for c in conns:
         try:
+            c[1].get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                                     struct.pack("ii", 1, 0))
             c[1].transport.abort()
         except Exception:
             pass
@@ -97,14 +103,20 @@ async def hold(limit):
     best = 0
     t0 = time.time()
 
-    lo, hi = map(int, PORTS.split("-")) if PORTS else (0, -1)
-    srcs = iter(range(lo, hi + 1))
+    def sources():
+        for part in (PORTS or "auto").split(","):
+            if part == "auto":
+                while True:
+                    yield 0
+            lo, hi = map(int, part.split("-"))
+            yield from range(lo, hi + 1)
+    srcs = sources()
 
     async def opener():
         nonlocal out_of_ports
         try:
             while True:
-                src = next(srcs, None) if PORTS else 0
+                src = next(srcs, None)
                 if src is None:
                     out_of_ports = True
                     return
@@ -135,7 +147,8 @@ async def hold(limit):
         return ok == n
 
     tasks, mark, started, healthy = set(), 64, 0, True
-    while started < limit and not out_of_ports and sum(errs.values()) < 10:
+    # stop if handshakes keep failing (more than 10 + 0.1%: a few time out under heavy load)
+    while started < limit and not out_of_ports and sum(errs.values()) < 10 + started // 1000:
         await sem.acquire()
         if out_of_ports:
             break
@@ -155,7 +168,7 @@ async def hold(limit):
         await checkpoint()
     close(conns)
     why = ("a checkpoint failed" if not healthy else "client out of ports" if out_of_ports
-           else "handshakes failing" if sum(errs.values()) >= 10 else f"limit {limit}")
+           else "handshakes failing" if sum(errs.values()) >= 10 + started // 1000 else f"limit {limit}")
     print(f"connections: {best}  ({len(conns)} opened in {time.time() - t0:.0f}s, stopped: {why}"
           + (f", handshake errors {dict(errs)}" if errs else "") + ")")
     return best

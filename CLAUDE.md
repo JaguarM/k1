@@ -11,11 +11,21 @@ Security does not matter. Correctness for real clients (curl, Chrome, Firefox) d
 - `./measure.sh` builds, boots it in QEMU (TCG, no KVM here), fetches it with curl
   (fresh connections + keep-alive), prints PASS + size + largest routines
 - `./score.sh [image] [max]` boots the image and runs `tools/load.py hold`: opens TLS
-  connections (4 handshakes in flight: more overflow the NIC ring; starts 4 ms apart because slirp's listen backlog is 1),
-  keeps them all open, fetches the page over every one at 64, 128, 256, ... open and at the
-  end; stops at the first failing checkpoint, at `max`, or when the client runs out of ports
-  (28,232: Linux's ephemeral range; ~13 minutes, ~8 GB of client RAM at full scale). `tools/load.py` also has
+  connections from every unprivileged client port (explicit binds to 1024-32767 and
+  61000-65535, then Linux's ephemeral range; ~64.5K), keeps them all open, fetches the page
+  over every one at 64, 128, 256, ... open and at the end; stops at the first failing
+  checkpoint, at `max`, out of ports, or when more than 10 + 0.1% of handshakes fail.
+  4 handshakes in flight (more overflow the NIC ring: with 16, handshakes past 32K open
+  started timing out, since slirp walks all its sockets on every main-loop iteration, ~0.5 s
+  at 60K, and resends back off); starts 4 ms apart (slirp's listen backlog is 1). ~45 minutes,
+  ~5 GB of client RAM, and most of 127.0.0.1's ports are taken meanwhile. `PORTS=auto` keeps
+  to the ephemeral range (28,232, ~8 minutes). The guest has one slot per client port and
+  slirp shows every client as 10.0.2.2, so 65,536 is the ceiling. `tools/load.py` also has
   `burst K` (K clients at the same moment), `seq N` (handshake rate) and `ka N` (keep-alive).
+- `tools/tbcheck.py build/os.lst` (run by measure.sh) warns when two `ret` targets of the
+  SHA-256 round loop share a slot of QEMU's TCG jump cache: within one 4 KiB page it has only
+  64 slots ((pc ^ pc >> 6) & 63), and a collision makes handshakes ~4x slower. Fix by moving
+  routines around (zero bytes).
 - `./browsers.sh` checks Chrome (cert errors must be bypassable, page renders) and
   Firefox (`tools/ffcheck.py`, Marionette, cert exception in a throwaway profile).
   Run after any TLS/cert/TCP/HTTP change.
@@ -40,7 +50,8 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 - `tools/gen.py`: build-time cert, CertificateVerify template, HTTP response -> `build/gen.inc`
   (and `build/gen.h` for the C version)
 - `www/index.html`: the served file (keep it fixed when comparing sizes)
-- `src/os.c`, `src/crypto.h`, `src/start.S`: the C version (~4.5 KB), a readable reference
+- `src/os.c`, `src/crypto.h`, `src/start.S`: the C version (~4.5 KB), a readable reference for
+  the size-only design (X25519 doublings, 256 connection slots); not updated since
 - `tools/ffcheck.py`: Firefox via Marionette; `tools/certerr.py`: Chrome net-log cert flags;
   `tools/sizes.py`: bytes per routine from the NASM listing
 
@@ -75,24 +86,29 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 - `keys` writes 20 junk bytes after the IV (HKDF-Expand always stores 32): slots are 128 bytes.
 - No ARP replies: one unsolicited ARP reply at boot puts 10.0.2.15 -> MAC 0 in slirp's table.
 - Replies are built in place from the received frame; Ethernet addresses are not swapped
-  (slirp ignores them); the window field is whatever slirp sent us. TCP segments are at
-  most 127 bytes (imm8 compares).
+  (slirp ignores them); the window field is whatever slirp sent us. One segment per reply
+  (the largest, our handshake flight, is ~420 bytes), so there is no send-side state at all.
+  The TCP pseudo-header reuses the received IP header's protocol byte.
 - The frame buffer lives at address 0 (old real-mode IVT) so `xor reg, reg` loads it; the
   boot ARP announcement therefore carries IVT junk as MAC (fine: promiscuous NIC).
 - NE2000 packet header read with one 32-bit `in` (QEMU allows it); 4 bytes past the frame
   are read too.
 - No stack setup: QEMU's multiboot loader leaves esp = 0x6f10.
 - Multiboot bss_end covers the 31 zero bytes after the base point 9 (PUB must stay last).
-- Cert: X.509 v1, empty names, no extensions, compressed EC point. Its own signature uses a
-  fixed nonce (K_CERT in gen.py) whose r has 2 leading zero bytes, and notBefore's time of
-  day is chosen so s does too (deterministic build). Chrome: AUTHORITY_INVALID +
-  COMMON_NAME_INVALID, both bypassable.
+- Cert (140 bytes): X.509 v1, no extensions, compressed EC point, and no signature (an empty
+  BIT STRING). The issuer name (one attribute: OID 2.5.4 = ""; Firefox calls a 1-byte OID
+  such as 2.5 bad DER, not overridable) differs from the empty subject,
+  so it is not self-signed: clients look for the issuer, don't find it, and never check the
+  signature. Chrome: AUTHORITY_INVALID + COMMON_NAME_INVALID, both bypassable; Firefox:
+  unknown issuer, overridable. The key is still d = 1/r for the CertificateVerify trick.
 - HTTP response: `HTTP/1.1 200\nContent-Length:N\n\n` (bare LFs, no reason phrase).
 - No final reduction in Poly1305 (wrong only with ~2^-128 probability).
 - SHA-256 pads in place: every buffer passed to sha256 needs 72 spare bytes after the data.
 
 ## Tried and rejected
-- Dummy cert signature (-62 bytes): Firefox says nssBadCert, which an exception can't override.
+- Dummy cert signature with issuer == subject (both empty): Firefox verifies the
+  self-signature and says nssBadCert, which an exception can't override. (A distinct issuer
+  name avoids the check: that is what the cert does now.)
 - Sharing one multiply routine in the C version, table-driven ChaCha indices: no gain.
 - Field registers at address 0 (saved 12 in the old `run`/`x25519`): the M/K constants then
   needed explicit zeroing, which ate the gain; the frame buffer is the better tenant for 0.

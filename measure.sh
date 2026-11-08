@@ -40,6 +40,7 @@ SIZE=$(stat -c %s "$IMG")
 echo "PASS  image=$IMG  size=${SIZE} bytes"
 LST=${IMG%.bin}.lst
 if [[ -f "$LST" ]]; then
+  python3 tools/tbcheck.py "$LST" || true   # warns if TCG would run the handshake ~4x slower
   echo "--- largest routines/data (bytes) ---"
   python3 tools/sizes.py "$LST" 14
 fi

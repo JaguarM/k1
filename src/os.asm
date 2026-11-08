@@ -203,7 +203,7 @@ tcp:
         test dl, 2
         jz .ns
         inc eax                 ; SYN: a new connection; the SYN takes a sequence number
-        mov [ebp+C_NXT], eax    ; (so it lands below as "not the next byte": acked, no more)
+        mov [ebp+C_NXT], eax    ; (so the check below passes, with nothing to add)
         mov [ebp+C_ST], ecx     ; (a SYN carries no payload: ecx = 0)
         mov [ebp+C_LEN], eax    ; until the ClientHello is in: slirp's ISN + 1
 .ns:    push edx                ; flags
@@ -224,28 +224,7 @@ tcp:
         mov edi, OB             ; edi = end of our output
         push edi
         cmp [ebp+C_ST], ebx
-        jne .walk
-        mov edx, [ebp+C_LEN]    ; still waiting for the ClientHello: collect it in a bucket
-        mov eax, [ebp+C_NXT]
-        sub eax, edx            ; bytes so far, this segment included
-        shl edx, 13             ; slirp's ISN + 1 = 2 + 64000 n, n += 1 per connection:
-        shr edx, 10             ; 16 + 4 KiB * (125 n mod 1024), so 1024 in a row differ
-        bts edx, 22             ; + CHB
-        push edi
-        lea edi, [edx+eax]
-        sub edi, ecx
-        rep movsb
-        pop edi
-        movzx ecx, word [edx+3]
-        xchg cl, ch             ; record body length
-        sub eax, 5
-        cmp eax, ecx
-        jl .send                ; not all there yet (signed: a slot that never saw a SYN)
-        inc dword [ebp+C_ST]
-        mov [ebp+C_LEN], ebx    ; the next record starts with the client's next byte
-        lea esi, [edx+5]
-        call handshake
-        jmp short .send
+        je .ch
 .walk:  mov eax, [ebp+C_LEN]    ; bytes of the current record still to come
 .w:     sub ecx, eax            ; skip whole records; we only read their headers
         jbe .wend
@@ -270,6 +249,26 @@ tcp:
         pop ecx
         pop esi
         jmp .w
+.ch:    mov edx, [ebp+C_LEN]    ; still waiting for the ClientHello: collect it in a bucket
+        mov eax, [ebp+C_NXT]
+        sub eax, edx            ; bytes so far, this segment included
+        shl edx, 13             ; slirp's ISN + 1 = 2 + 64000 n, n += 1 per connection:
+        shr edx, 10             ; 16 + 4 KiB * (125 n mod 1024), so 1024 in a row differ
+        bts edx, 22             ; + CHB
+        push edi
+        lea edi, [edx+eax]
+        sub edi, ecx
+        rep movsb
+        pop edi
+        movzx ecx, word [edx+3]
+        xchg cl, ch             ; record body length
+        sub eax, 5
+        cmp eax, ecx
+        jl .send                ; not all there yet (signed: a slot that never saw a SYN)
+        inc dword [ebp+C_ST]
+        lea esi, [edx+5]
+        call handshake
+        xor ecx, ecx            ; C_LEN = 0: the next record starts with the client's next byte
 .wend:  neg ecx
         mov [ebp+C_LEN], ecx
 .send:  pop esi                 ; OB
@@ -277,23 +276,15 @@ tcp:
         pop eax                 ; flags
         and eax, 3
         or ecx, eax
-        jz .ret                 ; pure ACK: stay quiet
-        or al, 0x18             ; ACK|PSH (+SYN or FIN)
-.sl:    mov ecx, edi            ; segments of up to 127 bytes (imm8-sized; TCP doesn't mind)
-        sub ecx, esi
-        cmp ecx, 127
-        jbe .ok
-        push 127
-        pop ecx
-.ok:    call tcp_out
-        add esi, ecx
-        cmp esi, edi
-        jb .sl
-.ret:   ret
+        jnz .tx
+        ret                     ; pure ACK: stay quiet
+.tx:    or al, 0x18             ; ACK|PSH (+SYN or FIN)
+        mov ecx, edi
+        sub ecx, esi            ; all in one segment: the largest reply, our flight, is ~400 bytes
 
-; tcp_out: send ecx bytes at esi with flags al, reusing the swapped headers in FR
+; tcp_out (falls through from tcp): send ecx bytes at esi with flags al, reusing the swapped
+; headers in FR
 tcp_out:
-        pushad
         xor ebx, ebx            ; FR
         mov ebp, ecx            ; payload length
         mov [ebx+47], al
@@ -303,9 +294,8 @@ tcp_out:
         lea ecx, [ebp+20]       ; TCP length
         mov eax, ecx
         xchg al, ah
-        shl eax, 16
-        mov ah, 6
-        mov [ebx+22], eax       ; pseudo header in place: 0, 6, length, then the IPs
+        mov [ebx+24], ax        ; pseudo header in place: 0, 6 (still there: protocol TCP),
+        mov [ebx+22], bl        ; length, then the IPs
         mov byte [ebx+46], 0x50 ; no options (the window stays whatever slirp offered us)
         and dword [ebx+50], 0
         lea esi, [ebx+22]
@@ -322,14 +312,7 @@ tcp_out:
         call csum
         mov [ebx+24], ax
         lea ecx, [ebp+54]
-        call nic_send
-        mov eax, [ebx+38]
-        bswap eax
-        add eax, ebp
-        bswap eax
-        mov [ebx+38], eax       ; advance our seq
-        popad
-        ret
+        jmp nic_send
 
 ; csum: eax = internet checksum of ecx bytes at esi (clobbers ecx, edx, esi).
 ; dec leaves CF alone, so the end-around carry rides through the loop in adc.
@@ -620,6 +603,21 @@ sha256:
         popad
         ret
 
+; sigma: edx = xor of eax rotated by each count byte in ecx (count | 0x20 = shift instead)
+sigma:
+        xor edx, edx
+.s:     push eax
+        test cl, 0x20
+        jnz .sh
+        ror eax, cl
+        jmp .x
+.sh:    shr eax, cl
+.x:     xor edx, eax
+        pop eax
+        shr ecx, 8
+        jnz .s
+        ret
+
 ; wnext: eax = message schedule word W[ebp] (window at edi, message at esi)
 wnext:  cmp ebp, 16
         jae .sch
@@ -637,21 +635,6 @@ wnext:  cmp ebp, 16
         add eax, edx
         add eax, [edi+96]       ; W[i-16]
         add eax, [edi+60]       ; W[i-7]
-        ret
-
-; sigma: edx = xor of eax rotated by each count byte in ecx (count | 0x20 = shift instead)
-sigma:
-        xor edx, edx
-.s:     push eax
-        test cl, 0x20
-        jnz .sh
-        ror eax, cl
-        jmp .x
-.sh:    shr eax, cl
-.x:     xor edx, eax
-        pop eax
-        shr ecx, 8
-        jnz .s
         ret
 
 ; hmac: edi = HMAC-SHA256(key = 32 bytes at ebx, ecx <= 64 bytes at esi)
@@ -775,103 +758,6 @@ chacha:
         popad
         ret
 
-; poly1305: edi = tag of ecx 16-byte blocks at esi; 32-byte key at ebx (r is clamped in place).
-; h has 17 limbs of 8 bits (the top one 2, plus a little), in dwords. With R[16 + j] = r[j] and
-; R[j - 1] = 320 r[j] (2^136 = 320 mod 2^130 - 5), limb k of h * r = sum_i h[i] * R[16 + k - i].
-poly1305:
-        pushad
-        push edi
-        mov eax, 0x0FFFFFFF
-        and [ebx], eax
-        mov al, 0xFC
-        and [ebx+4], eax
-        and [ebx+8], eax
-        and [ebx+12], eax
-        push esi
-        push ecx
-        mov edi, PH
-        push 17
-        pop ecx
-        xor eax, eax
-        rep stosd               ; h = 0
-        mov esi, ebx
-        add edi, 68             ; &R[16]
-        mov cl, 16
-.r:     lodsb                   ; (R[15] = 320 r[16] and R[32] = r[16] are 0: never written)
-        stosd
-        imul edx, eax, 320
-        mov [edi-72], edx
-        loop .r
-        pop ecx
-        pop esi
-.blk:   push ecx
-        mov edi, PH             ; h += block + 2^128 (eax < 256 here)
-        mov cl, 16
-.m:     lodsb
-        add [edi], eax
-        scasd
-        loop .m
-        inc dword [edi]
-        push esi
-        mov edi, XT             ; XT = h * r: under 2^30 per limb
-        mov ebx, RR + 64
-        mov cl, 17
-.k:     push ecx
-        mov esi, PH
-        mov edx, ebx
-        xor ebp, ebp
-        mov cl, 17
-.i:     lodsd
-        imul eax, [edx]
-        add ebp, eax
-        sub edx, 4
-        loop .i
-        xchg eax, ebp
-        stosd
-        add ebx, 4
-        pop ecx
-        loop .k
-        xor ebx, ebx            ; carry XT back into h, then twice more in place: 2^130
-        mov dl, 3               ; wraps as 5 (the 3rd pass only ripples a carry or two)
-        mov esi, XT
-.pass:  mov edi, PH
-        mov cl, 16
-.c:     lodsd
-        add ebx, eax
-        movzx eax, bl
-        sar ebx, 8
-        stosd
-        loop .c
-        lodsd
-        add ebx, eax
-        mov eax, ebx
-        and eax, 3
-        stosd                   ; (leaves eax < 4 for the next block's lodsb)
-        sar ebx, 2
-        lea ebx, [ebx+ebx*4]
-        lea esi, [edi-68]
-        dec dl
-        jnz .pass
-        pop esi
-        pop ecx
-        loop .blk
-        pop edi
-        mov ebx, [esp+16]
-        mov esi, PH
-        mov cl, 16
-        xor edx, edx
-.t:     lodsd                   ; tag = h + s mod 2^128
-        add edx, eax
-        movzx eax, byte [ebx+16]
-        inc ebx
-        add edx, eax
-        mov [edi], dl
-        inc edi
-        shr edx, 8
-        loop .t
-        popad
-        ret
-
 ; seal: TLS 1.3 record at edi for ecx plaintext bytes at esi (last byte = inner content type),
 ; key|0|iv at ebx, sequence number edx. Returns edi = end of record.
 seal:
@@ -941,14 +827,101 @@ seal:
         movsb
         add esi, 11
         rep movsb               ; ciphertext
-        mov ecx, edx
-        mov esi, SB
         mov ebx, PK
-        call poly1305           ; tag
-        add edi, 16
+        ; Poly1305 tag of the edx 16-byte blocks at SB, key at PK (r is clamped in place).
+        ; h has 17 limbs of 8 bits (the top one 2, plus a little), in dwords. With R[16 + j] = r[j] and
+        ; R[j - 1] = 320 r[j] (2^136 = 320 mod 2^130 - 5), limb k of h * r = sum_i h[i] * R[16 + k - i].
+        push edi                ; where the tag goes
+        mov eax, 0x0FFFFFFF
+        and [ebx], eax
+        mov al, 0xFC
+        and [ebx+4], eax
+        and [ebx+8], eax
+        and [ebx+12], eax
+        mov edi, PH
+        push 17
+        pop ecx
+        xor eax, eax
+        rep stosd               ; h = 0
+        mov esi, ebx
+        add edi, 68             ; &R[16]
+        mov cl, 16
+.r:     lodsb                   ; (R[15] = 320 r[16] and R[32] = r[16] are 0: never written)
+        stosd
+        imul ebp, eax, 320
+        mov [edi-72], ebp
+        loop .r
+        mov ecx, edx            ; blocks
+        mov esi, SB
+.blk:   push ecx
+        mov edi, PH             ; h += block + 2^128 (eax < 256 here)
+        mov cl, 16
+.m:     lodsb
+        add [edi], eax
+        scasd
+        loop .m
+        inc dword [edi]
+        push esi
+        mov edi, XT             ; XT = h * r: under 2^30 per limb
+        mov ebx, RR + 64
+        mov cl, 17
+.k:     push ecx
+        mov esi, PH
+        mov edx, ebx
+        xor ebp, ebp
+        mov cl, 17
+.i:     lodsd
+        imul eax, [edx]
+        add ebp, eax
+        sub edx, 4
+        loop .i
+        xchg eax, ebp
+        stosd
+        add ebx, 4
+        pop ecx
+        loop .k
+        xor ebx, ebx            ; carry XT back into h, then twice more in place: 2^130
+        mov dl, 3               ; wraps as 5 (the 3rd pass only ripples a carry or two)
+        mov esi, XT
+.pass:  mov edi, PH
+        mov cl, 16
+.c:     lodsd
+        add ebx, eax
+        movzx eax, bl
+        sar ebx, 8
+        stosd
+        loop .c
+        lodsd
+        add ebx, eax
+        mov eax, ebx
+        and eax, 3
+        stosd                   ; (leaves eax < 4 for the next block's lodsb)
+        sar ebx, 2
+        lea ebx, [ebx+ebx*4]
+        lea esi, [edi-68]
+        dec dl
+        jnz .pass
+        pop esi
+        pop ecx
+        loop .blk
+        pop edi
+        mov ebx, PK+16
+        mov esi, PH
+        mov cl, 16
+        xor edx, edx
+.t:     lodsd                   ; tag = h + s mod 2^128
+        add edx, eax
+        movzx eax, byte [ebx]
+        inc ebx
+        add edx, eax
+        mov [edi], dl
+        inc edi
+        shr edx, 8
+        loop .t
         mov [esp], edi
         popad
         ret
+
 
 ; ----------------------------------------------------------------------------
 

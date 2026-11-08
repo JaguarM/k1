@@ -5,7 +5,6 @@ ECDSA trick (zero security): we sign with the fixed nonce k = 1, so
 r = x(G) mod n is a constant, and we choose the private key d = r^-1 mod n.
 Then s = k^-1 (z + r*d) = z + 1 (mod n): signing is just SHA-256 plus one.
 """
-import hashlib
 import sys
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -15,9 +14,6 @@ N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
 R = GX % N
 D = pow(R, -1, N)
-K_CERT = 40393  # first k >= 2 with x(kG) < 2^239 (found by brute force)
-
-
 def tlv(tag, body):
     n = len(body)
     ln = bytes([n]) if n < 128 else bytes([0x80 | ((n.bit_length() + 7) // 8)]) + n.to_bytes((n.bit_length() + 7) // 8, "big")
@@ -25,32 +21,24 @@ def tlv(tag, body):
 
 
 def make_cert(key):
-    """Smallest X.509 we found browsers accept: v1, empty names, no extensions."""
+    """Smallest X.509 we found browsers accept: v1, no extensions, and no real signature.
+
+    The issuer name differs from the (empty) subject, so the cert is not self-signed: clients
+    look for the issuer, don't find it, and report an unknown issuer (bypassable) without ever
+    checking the signature, which is therefore an empty BIT STRING. (With issuer == subject,
+    Firefox verified the self-signature and refused a dummy one as nssBadCert.)
+    """
     sigalg = tlv(0x30, tlv(0x06, bytes.fromhex("2a8648ce3d040302")))  # ecdsa-with-SHA256
     # Compressed point (33 bytes instead of 65): curl, Chrome and Firefox all accept it.
     algid = tlv(0x30, tlv(0x06, bytes.fromhex("2a8648ce3d0201")) + tlv(0x06, bytes.fromhex("2a8648ce3d030107")))
     point = key.public_key().public_bytes(serialization.Encoding.X962,
                                           serialization.PublicFormat.CompressedPoint)
     spki = tlv(0x30, algid + tlv(0x03, b"\x00" + point))
-    # Real signature with a fixed nonce, so the build is deterministic. K_CERT was searched
-    # offline so that r = x(kG) < 2^239 (a 30-byte INTEGER); notBefore's time of day is
-    # then varied until s is < 2^239 too. That saves 4 bytes over a typical signature.
-    r = ec.derive_private_key(K_CERT, ec.SECP256R1()).public_key().public_numbers().x % N
-    assert r.bit_length() < 240
-    kinv = pow(K_CERT, -1, N)
-    for t in range(86400):
-        when = b"000101%02d%02d%02dZ" % (t // 3600, t // 60 % 60, t % 60)
-        validity = tlv(0x30, tlv(0x17, when) + tlv(0x17, b"491231000000Z"))
-        tbs = tlv(0x30, tlv(0x02, b"\x01") + sigalg + tlv(0x30, b"") + validity
-                  + tlv(0x30, b"") + spki)
-        sval = kinv * (int.from_bytes(hashlib.sha256(tbs).digest(), "big") + r * D) % N
-        if sval.bit_length() < 240:
-            break
-    sig = tlv(0x30, tlv(0x02, r.to_bytes(30, "big")) + tlv(0x02, sval.to_bytes(30, "big")))
-    key.public_key().verify(sig, tbs, ec.ECDSA(hashes.SHA256()))  # raises if wrong
-    # (A dummy signature would save 62 more bytes, but Firefox then says nssBadCert, which an
-    # exception can't override. Chrome and curl don't care.)
-    return tlv(0x30, tbs + sigalg + tlv(0x03, b"\x00" + sig))
+    # (Firefox calls a 1-byte attribute OID like 2.5 bad DER: 2.5.4 is the shortest it takes)
+    issuer = tlv(0x30, tlv(0x31, tlv(0x30, tlv(0x06, b"\x55\x04") + tlv(0x13, b""))))  # 2.5.4 = ""
+    validity = tlv(0x30, tlv(0x17, b"000101000000Z") + tlv(0x17, b"491231000000Z"))
+    tbs = tlv(0x30, tlv(0x02, b"\x01") + sigalg + issuer + validity + tlv(0x30, b"") + spki)
+    return tlv(0x30, tbs + sigalg + tlv(0x03, b"\x00"))
 
 
 def carr(name, data):
