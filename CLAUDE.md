@@ -21,6 +21,7 @@ Security does not matter. Correctness for real clients (curl, Chrome, Firefox) d
   Run after any TLS/cert/TCP/HTTP change.
 - `make test` checks the asm crypto (`src/os.asm` built with `-DHOST`, driven by
   `test/test_asm.c` in a 32-bit process) and the old C crypto against pyca/cryptography
+  (the asm has no X25519 any more; its x9/xm vectors are only checked for the C version)
 - `make c` builds the reference C version (`src/os.c`, `src/crypto.h`) as `build/os_c.bin`;
   `make debug` builds it with serial logging of segments/records (`-serial stdio`)
 
@@ -48,9 +49,12 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 - ECDSA nonce k=1 and private key d=1/r, so a signature is `s = SHA256(msg) + 1`, no EC math.
   The server random (client random echoed) is incremented until s is a plain 32-byte DER
   INTEGER with no carry, so the CertificateVerify is a fixed template (~2 tries/handshake).
-- X25519 private key is all-zero bytes, which clamps to 2^254: only doublings, no ladder.
-  Field ops run from a 2-bytes-per-op program (`run`); subtraction = multiply by -1.
-- One field routine (`fop`) does both mod 2^255-19 and mod 2^130-5 (Poly1305), parameterised.
+- No elliptic-curve math at all: our X25519 key share is 9, the base point itself, so the
+  shared secret X25519(their key, 9) is their own key share; the handshake feeds the client's
+  x25519 key share straight into HKDF-Extract. curl, Chrome and Firefox accept it. (Idea from
+  Gemini; it replaced 254 doublings with 8-bit limbs, ~200 bytes, and tripled the handshake rate.)
+- Poly1305: 8-bit limbs in dwords; h * r is 17 column sums over a table R (R[16 + j] = r[j],
+  R[j - 1] = 320 r[j], since 2^136 = 320 mod 2^130 - 5), then 3 carry passes.
 - SHA-256 constants are computed at boot (primes by trial division, cube roots by Newton
   on the x87, `fisttp` for the fraction bits).
 - Client data is never decrypted; client Finished is not verified. We count records:
@@ -84,14 +88,17 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
   day is chosen so s does too (deterministic build). Chrome: AUTHORITY_INVALID +
   COMMON_NAME_INVALID, both bypassable.
 - HTTP response: `HTTP/1.1 200\nContent-Length:N\n\n` (bare LFs, no reason phrase).
-- No final reduction in X25519/Poly1305 (wrong only with ~2^-128 probability).
+- No final reduction in Poly1305 (wrong only with ~2^-128 probability).
 - SHA-256 pads in place: every buffer passed to sha256 needs 72 spare bytes after the data.
 
 ## Tried and rejected
 - Dummy cert signature (-62 bytes): Firefox says nssBadCert, which an exception can't override.
 - Sharing one multiply routine in the C version, table-driven ChaCha indices: no gain.
-- Field registers at address 0 (saves 12 in `run`/`x25519`): the M/K constants then need
-  explicit zeroing, which eats the gain; the frame buffer is the better tenant for 0.
+- Field registers at address 0 (saved 12 in the old `run`/`x25519`): the M/K constants then
+  needed explicit zeroing, which ate the gain; the frame buffer is the better tenant for 0.
+- Draining the NE2000 into RAM during handshakes (for bursts): slirp delivers a burst of
+  ClientHello segments within one main-loop iteration while holding QEMU's global lock, and
+  the guest's port I/O needs that lock, so the ring overflows before the guest can drain it.
 
 ## Workflow
 Measure after every change; any protocol/cert/HTTP change also needs `./browsers.sh`.

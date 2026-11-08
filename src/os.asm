@@ -23,11 +23,9 @@ SH      equ BSS + 0x0CD20   ; SHA-256 chaining value
 ST      equ BSS + 0x0CD40   ; ChaCha20 state
 KS      equ BSS + 0x0CD80   ; ChaCha20 key stream block (64-byte aligned)
 PK      equ BSS + 0x0CDC0   ; Poly1305 key block
-XT      equ BSS + 0x0CE00   ; field op scratch, 64 dwords
-FE      equ BSS + 0x0CF00   ; X25519 registers, 8 x 32 dword limbs
-PH      equ BSS + 0x0D300   ; Poly1305 h, r, m: 17 dword limbs each
-PR      equ PH + 68             ; right after h: zeroing h leaves edi here; r[16] stays 0
-PM      equ PR + 68
+XT      equ BSS + 0x0CE00   ; Poly1305 h * r, 17 dwords
+PH      equ BSS + 0x0D300   ; Poly1305 h: 17 limbs of 8 bits (the top one: 2) in dwords
+RR      equ PH + 72         ; R[0..32] (R[-1] = PH + 68 is junk): see poly1305
 SLOTS   equ BSS + 0x0D500   ; key schedule values, 8 x 32 bytes, addressed from ebp
 KH      equ BSS + 0x0D600   ; handshake traffic key | 0 counter | iv
 CVB     equ BSS + 0x0D680   ; CertificateVerify content to be signed (+ room for padding)
@@ -43,8 +41,6 @@ S_D     equ -32
 S_HS    equ 0
 S_TS    equ 32
 S_TH    equ 64
-S_SEC   equ 96
-SEC     equ SLOTS + 128 + S_SEC
 
 C_ST    equ 0               ; connection: record counter (0 = waiting for the ClientHello)
 C_NXT   equ 4               ; next sequence number we expect from the client
@@ -53,7 +49,7 @@ C_KIV   equ 12              ; application key | 0 counter | iv (+20 bytes of jun
 
 %ifdef HOST
         section .text
-        global sha256, hmac, expand, x25519, seal, shaconst
+        global sha256, hmac, expand, seal, shaconst
 %else
         org 0x100000
 mb:     dd 0x1BADB002, 0x00010000, -(0x1BADB002 + 0x00010000)
@@ -108,10 +104,6 @@ shaconst:
         popad
         ret
 %else
-        mov esi, PUB            ; our key share = X25519(k, 9), computed in place
-        mov edi, esi
-        call x25519
-
         mov esi, nicinit        ; NE2000 setup: (register, value) pairs
         mov dh, 3
         push 7
@@ -358,15 +350,6 @@ csum:
 ; Writes ServerHello + encrypted flight to OB, returns edi = end. Clobbers all but ebp.
 handshake:
         push ebp
-        mov ebx, esi
-.ks:    inc ebx
-        cmp dword [ebx], 0x20001d00 ; key share entry: x25519, 32 bytes
-        jne .ks
-        push esi
-        lea esi, [ebx+4]
-        mov edi, SEC
-        call x25519             ; shared secret
-        pop esi
         mov edi, TR             ; transcript: ClientHello
         push esi
         rep movsb
@@ -394,7 +377,11 @@ handshake:
         lea edi, [ebp+S_ES]
         call hmac               ; early secret
         mov ebx, edi
-        lea esi, [ebp+S_SEC]
+        mov esi, TR
+.ks:    inc esi                 ; the client's x25519 key share: as ours is 9 (the base point),
+        cmp dword [esi], 0x20001d00 ; X25519(their key, 9) is that key share itself
+        jne .ks
+        lodsd
         lea edi, [ebp+S_HS]
         call stage              ; handshake secret
         pop ebx
@@ -736,163 +723,6 @@ expand:
         ret
 
 ; ----------------------------------------------------------------------------
-; Field arithmetic with 8-bit limbs in dwords, modulo 2^(8n-8+t) - c.
-; ebp -> {dd wrap = 2^(8n) mod p, dd c, db n, db t}
-; fop: edi = esi + ebx (al = 0) or esi * ebx (al = 1), partially reduced. Signed limbs are fine.
-fop:
-        pushad
-        push edi
-        xchg eax, edx
-        mov edi, XT
-        push edi                ; XT stays on the stack: [esp] is cheaper than its address
-        push 64
-        pop ecx
-        xor eax, eax
-        rep stosd
-        mov edi, [esp]
-        movzx ecx, byte [ebp+8]
-        test dl, dl
-        jnz .mul
-.add:   lodsd
-        add eax, [ebx]
-        stosd
-        add ebx, 4
-        loop .add
-        jmp .carry
-.mul:   push ecx                ; schoolbook product into XT[0 .. 2n)
-        lodsd
-        xchg eax, edx
-        push esi
-        push edi
-        mov esi, ebx
-        movzx ecx, byte [ebp+8]
-        test edx, edx           ; skip zero limbs: the constants -1 and 121665 have one limb
-        jz .z
-.mj:    lodsd
-        imul eax, edx
-        add [edi], eax
-        scasd
-        loop .mj
-.z:     pop edi
-        scasd
-        pop esi
-        pop ecx
-        loop .mul
-        mov edi, [esp]          ; fold the top half: x[i] += wrap * x[i+n]
-        movzx ecx, byte [ebp+8]
-        lea esi, [edi+ecx*4]
-.f:     lodsd
-        imul eax, [ebp]
-        add [edi], eax
-        scasd
-        loop .f
-.carry: xor eax, eax            ; carry passes; top limb keeps t bits, overflow * c wraps
-        mov dl, 3               ; 3rd pass: values right next to 2^255 overflow once more
-.pass:  mov edi, [esp]
-        movzx esi, byte [ebp+8]
-.c:     add eax, [edi]
-        mov cl, 8
-        dec esi
-        jnz .w
-        mov cl, [ebp+9]
-.w:     mov ebx, eax
-        sar eax, cl
-        push eax
-        shl eax, cl
-        sub ebx, eax
-        pop eax
-        mov [edi], ebx
-        scasd
-        test esi, esi
-        jnz .c
-        imul eax, [ebp+4]
-        dec dl
-        jnz .pass
-        pop esi                 ; XT
-        pop edi
-        movzx ecx, byte [ebp+8]
-        rep movsd
-        popad
-        ret
-
-; run: execute ecx field ops from the 16-bit program at edx on the X25519 registers.
-; op = a | b << 3 | d << 6 | mul << 9  means  R[d] = R[a] (+ or *) R[b]
-run:
-        pushad
-.l:     push ecx
-        movzx eax, word [edx]
-        inc edx
-        inc edx
-        push edx
-        mov cl, 3
-.f:     mov edx, eax
-        and edx, 7
-        shl edx, 7
-        add edx, FE
-        push edx
-        shr eax, 3
-        loop .f
-        pop edi
-        pop ebx
-        pop esi
-        call fop
-        pop edx
-        pop ecx
-        loop .l
-        popad
-        ret
-
-; x25519: edi = X25519(k, u at esi) for k = 2^254, i.e. the all-zero private key.
-; That scalar needs only 254 x-only doublings, then x/z by Fermat.
-x25519:
-        pushad
-        push edi
-        mov ebp, P25519
-        mov edi, FE             ; X = u
-        push 32
-        pop ecx
-        xor eax, eax
-.ld:    lodsb
-        stosd
-        loop .ld
-        xor eax, eax            ; Z = 1
-        inc eax
-        stosd
-        dec eax
-        mov cl, 31
-        rep stosd
-        dec eax                 ; M = -1 and K = 121665 (their upper limbs stay zero)
-        stosd
-        mov dword [edi+124], 121665
-        mov bl, 254
-.dbl:   mov edx, P_DBL
-        mov cl, 11
-        call run
-        dec bl
-        jnz .dbl
-        push -21                ; bits of p-2 = 2^255-21, LSB first; sar keeps feeding ones
-        pop edi
-        dec ebx                 ; 255 bits
-.inv:   mov edx, P_INV          ; X *= Z^(p-2), right-to-left
-        push 2
-        pop ecx
-        sar edi, 1
-        jc .r
-        inc edx
-        inc edx
-        dec ecx
-.r:     call run
-        dec bl
-        jnz .inv
-        pop edi
-        mov esi, FE
-        mov cl, 32
-.st:    lodsd
-        stosb
-        loop .st
-        popad
-        ret
-
 ; ----------------------------------------------------------------------------
 ; chacha: edi = ChaCha20 block of the 16-dword state at esi
 chacha:
@@ -945,11 +775,12 @@ chacha:
         popad
         ret
 
-; poly1305: edi = tag of ecx 16-byte blocks at esi; 32-byte key at ebx (r is clamped in place)
+; poly1305: edi = tag of ecx 16-byte blocks at esi; 32-byte key at ebx (r is clamped in place).
+; h has 17 limbs of 8 bits (the top one 2, plus a little), in dwords. With R[16 + j] = r[j] and
+; R[j - 1] = 320 r[j] (2^136 = 320 mod 2^130 - 5), limb k of h * r = sum_i h[i] * R[16 + k - i].
 poly1305:
         pushad
         push edi
-        mov ebp, P1305
         mov eax, 0x0FFFFFFF
         and [ebx], eax
         mov al, 0xFC
@@ -962,31 +793,65 @@ poly1305:
         push 17
         pop ecx
         xor eax, eax
-        rep stosd               ; h = 0, edi = PR
-        mov esi, ebx            ; r = clamped key bytes (r[16] stays 0)
+        rep stosd               ; h = 0
+        mov esi, ebx
+        add edi, 68             ; &R[16]
         mov cl, 16
-.r:     lodsb
+.r:     lodsb                   ; (R[15] = 320 r[16] and R[32] = r[16] are 0: never written)
         stosd
+        imul edx, eax, 320
+        mov [edi-72], edx
         loop .r
         pop ecx
         pop esi
 .blk:   push ecx
-        mov edi, PM
-        push 16
-        pop ecx
+        mov edi, PH             ; h += block + 2^128 (eax < 256 here)
+        mov cl, 16
 .m:     lodsb
-        stosd
+        add [edi], eax
+        scasd
         loop .m
-        mov byte [edi], 1       ; + 2^128
+        inc dword [edi]
         push esi
+        mov edi, XT             ; XT = h * r: under 2^30 per limb
+        mov ebx, RR + 64
+        mov cl, 17
+.k:     push ecx
         mov esi, PH
-        mov ebx, PM
-        mov edi, esi
-        xor eax, eax
-        call fop                ; h += m
-        mov ebx, PR
-        inc eax
-        call fop                ; h *= r
+        mov edx, ebx
+        xor ebp, ebp
+        mov cl, 17
+.i:     lodsd
+        imul eax, [edx]
+        add ebp, eax
+        sub edx, 4
+        loop .i
+        xchg eax, ebp
+        stosd
+        add ebx, 4
+        pop ecx
+        loop .k
+        xor ebx, ebx            ; carry XT back into h, then twice more in place: 2^130
+        mov dl, 3               ; wraps as 5 (the 3rd pass only ripples a carry or two)
+        mov esi, XT
+.pass:  mov edi, PH
+        mov cl, 16
+.c:     lodsd
+        add ebx, eax
+        movzx eax, bl
+        sar ebx, 8
+        stosd
+        loop .c
+        lodsd
+        add ebx, eax
+        mov eax, ebx
+        and eax, 3
+        stosd                   ; (leaves eax < 4 for the next block's lodsb)
+        sar ebx, 2
+        lea ebx, [ebx+ebx*4]
+        lea esi, [edi-68]
+        dec dl
+        jnz .pass
         pop esi
         pop ecx
         loop .blk
@@ -1086,35 +951,6 @@ seal:
         ret
 
 ; ----------------------------------------------------------------------------
-%macro FOP 4                    ; d, a, op (0 add, 1 mul), b
-        dw %2 | (%4 << 3) | (%1 << 6) | (%3 << 9)
-%endmacro
-%define fX 0
-%define fZ 1
-%define fM 2                    ; -1
-%define fK 3                    ; 121665
-%define fA 4
-%define fB 5
-%define fT 6
-%define fE 7
-P_DBL:  FOP fA, fX, 0, fZ       ; A = x + z
-        FOP fT, fM, 1, fZ       ; (constants first: fop skips their zero limbs)
-        FOP fB, fX, 0, fT       ; B = x - z
-        FOP fA, fA, 1, fA       ; AA
-        FOP fB, fB, 1, fB       ; BB
-        FOP fT, fM, 1, fB
-        FOP fE, fA, 0, fT       ; E = AA - BB
-        FOP fX, fA, 1, fB       ; x = AA * BB
-        FOP fT, fK, 1, fE
-        FOP fT, fT, 0, fA
-        FOP fZ, fE, 1, fT       ; z = E * (AA + 121665 E)
-P_INV:  FOP fX, fX, 1, fZ
-        FOP fZ, fZ, 1, fZ
-
-P25519: dd 38, 19
-        db 32, 7
-P1305:  dd 320, 5
-        db 17, 2
 
 TWO32:  dd 0x4F800000            ; 2^32 as a float
 

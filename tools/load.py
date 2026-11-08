@@ -7,6 +7,8 @@
                         over every open connection. Stops at the first checkpoint where any
                         connection fails, at N, or when the client runs out of ports.
                         Prints "connections: C" = most connections that all worked at once.
+                        PORTS=lo-hi binds each connection to the next free source port in that
+                        range instead of letting the kernel pick from its ephemeral range.
   load.py burst K[,K..] K clients connect at the same moment, each fetches the page, all stay
                         open, then each fetches it again over the same connection
   load.py seq N         N fresh connections, one after another (handshake rate)
@@ -19,6 +21,8 @@ PORT = int(os.environ.get("PORT", "8443"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "60"))  # per handshake / per request
 INFLIGHT = int(os.environ.get("INFLIGHT", "4"))
 GAP = float(os.environ.get("GAP", "0.004"))  # between connection starts: slirp's listen backlog is 1
+VERIFY = int(os.environ.get("VERIFY", "64"))  # requests in flight at checkpoints
+PORTS = os.environ.get("PORTS", "")
 EXPECT = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "www", "index.html"), "rb").read()
 REQ = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
 
@@ -27,6 +31,9 @@ CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 if os.environ.get("SSLKEYLOGFILE"):
     CTX.keylog_filename = os.environ["SSLKEYLOGFILE"]
+# asyncio's SSL transport allocates a read buffer this big per connection (256 KiB by default):
+# our responses are ~100 bytes, and tens of thousands of connections must fit in the client's RAM
+asyncio.sslproto.SSLProtocol.max_size = 16 * 1024
 
 
 def ename(e):
@@ -37,9 +44,10 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-async def connect():
+async def connect(src=0):
     return await asyncio.wait_for(
-        asyncio.open_connection(HOST, PORT, ssl=CTX, ssl_handshake_timeout=TIMEOUT), TIMEOUT)
+        asyncio.open_connection(HOST, PORT, ssl=CTX, ssl_handshake_timeout=TIMEOUT,
+                                local_addr=(HOST, src) if src else None), TIMEOUT)
 
 
 async def get(conn):
@@ -89,14 +97,26 @@ async def hold(limit):
     best = 0
     t0 = time.time()
 
+    lo, hi = map(int, PORTS.split("-")) if PORTS else (0, -1)
+    srcs = iter(range(lo, hi + 1))
+
     async def opener():
         nonlocal out_of_ports
         try:
-            conns.append(await connect())
-        except OSError as e:
-            if e.errno == errno.EADDRNOTAVAIL:
-                out_of_ports = True
-            errs[ename(e)] += 1
+            while True:
+                src = next(srcs, None) if PORTS else 0
+                if src is None:
+                    out_of_ports = True
+                    return
+                try:
+                    conns.append(await connect(src))
+                    return
+                except OSError as e:
+                    if e.errno == errno.EADDRINUSE and src:
+                        continue  # something on this host already uses that port
+                    if e.errno == errno.EADDRNOTAVAIL:
+                        out_of_ports = True
+                    raise
         except Exception as e:
             errs[ename(e)] += 1
         finally:
@@ -107,7 +127,7 @@ async def hold(limit):
     async def checkpoint():
         nonlocal best, checked
         n = checked = len(conns)
-        ok, ferrs = await fetch_all(conns, INFLIGHT)
+        ok, ferrs = await fetch_all(conns, VERIFY)
         log(f"  {n:6d} open after {time.time() - t0:6.1f}s: {ok} served"
             + (f", errors {dict(ferrs)}" if ferrs else "")
             + (f"; handshake errors so far {dict(errs)}" if errs else ""))
