@@ -36,10 +36,15 @@ Security does not matter. Correctness for real clients (curl, Chrome, Firefox) d
   `make debug` builds it with serial logging of segments/records (`-serial stdio`)
 
 ## Machine contract (what measure.sh boots)
-`qemu-system-x86_64 -nodefaults -m 16 -kernel build/os.bin -netdev user,hostfwd=tcp::8443-:443 -device ne2k_isa,netdev=n0`
+`qemu-system-x86_64 -nodefaults -m 160 -kernel build/os.bin -netdev user,hostfwd=tcp::8443-:443 -device ne2k_isa,netdev=n0`
 Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x300, polled
 (no PCI, no IRQs, no DMA). Guest IP is 10.0.2.15 (slirp's hostfwd default), MAC
 00:00:00:00:00:00, NIC in promiscuous mode.
+
+Needs -m 160: the client IP's low nibble picks one of 16 x 8 MiB slot tables, from 8 MiB up
+(slirp's 10.0.2.2 uses the table at 24 MiB). `./tap.sh ./taprunc.sh W PER` runs k1 on a tap
+interface and loads it with `build/tapc` (`gcc -O2 -o build/tapc tools/tapc.c -lssl -lcrypto`;
+needs root): 240,000 connections held from 16 source IPs.
 
 ## Layout
 - `src/os.asm`: everything (boot, NE2000, TCP, TLS 1.3, crypto). Buffers live at fixed

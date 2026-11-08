@@ -11,7 +11,7 @@ IMG=${1:-build/os.bin}
 EXPECT=$(head -c 20 www/index.html)
 TMP=$(mktemp -d)
 
-qemu-system-x86_64 -nodefaults -display none -no-reboot -m 16 -kernel "$IMG" \
+qemu-system-x86_64 -nodefaults -display none -no-reboot -m 160 -kernel "$IMG" \
   -netdev user,id=n0,hostfwd=tcp:127.0.0.1:${PORT}-:443 -device ne2k_isa,netdev=n0 >/dev/null 2>&1 &
 QEMU_PID=$!
 trap 'kill $QEMU_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT

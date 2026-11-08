@@ -20,7 +20,7 @@ if [[ -z "$IMG" ]]; then
 fi
 LOG=$(mktemp)
 
-qemu-system-x86_64 -nodefaults -display none -no-reboot -m 16 \
+qemu-system-x86_64 -nodefaults -display none -no-reboot -m 160 \
   -kernel "$IMG" \
   -netdev user,id=n0,hostfwd=tcp:127.0.0.1:${PORT}-:443 \
   -device ne2k_isa,netdev=n0 >"$LOG" 2>&1 &

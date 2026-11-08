@@ -34,7 +34,7 @@ make                 # -> build/os.bin
 Or by hand:
 
 ```bash
-qemu-system-x86_64 -nodefaults -display none -m 16 -kernel build/os.bin \
+qemu-system-x86_64 -nodefaults -display none -m 160 -kernel build/os.bin \
   -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8443-:443 -device ne2k_isa,netdev=n0
 curl -k https://127.0.0.1:8443/
 ```
