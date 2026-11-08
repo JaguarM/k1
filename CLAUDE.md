@@ -113,6 +113,9 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 - Sharing one multiply routine in the C version, table-driven ChaCha indices: no gain.
 - Field registers at address 0 (saved 12 in the old `run`/`x25519`): the M/K constants then
   needed explicit zeroing, which ate the gain; the frame buffer is the better tenant for 0.
+- Cert validity as UTCTime without seconds (-4 bytes): curl and Chrome reject it.
+- More handshakes in flight in the score test (16 past 32K open): resends back off past the
+  60 s timeout while slirp crawls; 4 in flight reaches 64.5K without handshake failures.
 - Draining the NE2000 into RAM during handshakes (for bursts): slirp delivers a burst of
   ClientHello segments within one main-loop iteration while holding QEMU's global lock, and
   the guest's port I/O needs that lock, so the ring overflows before the guest can drain it.

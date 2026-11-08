@@ -1,7 +1,7 @@
 # k1
 
-k1 is a 2,334-byte bootable x86 "operating system" that serves a static web page over HTTPS
-(TLS 1.3) and holds 64,499 TLS connections at once. It boots in QEMU, drives an NE2000
+k1 is a 2,332-byte bootable x86 "operating system" that serves a static web page over HTTPS
+(TLS 1.3) and holds 64,491 TLS connections at once. It boots in QEMU, drives an NE2000
 network card, speaks just enough TCP, and does the whole TLS 1.3 handshake itself: ECDSA
 P-256, ChaCha20-Poly1305, SHA-256 / HKDF, all hand-written in assembly. curl, Chrome and
 Firefox load the page (after the usual certificate warning).
@@ -19,7 +19,7 @@ out of ports, keeps them all open, and checks that every one still serves the pa
 | | image | connections at once | score (connections / KiB) |
 |---|---|---|---|
 | size-only version | 2,714 bytes | 56 | 21 |
-| now | 2,334 bytes | 64,499 | 28,298 |
+| now | 2,332 bytes | 64,491 | 28,319 |
 
 ## Try it
 
@@ -56,7 +56,7 @@ Change `www/index.html` to serve something else.
   by Newton's method on the x87 FPU) instead of being stored.
 - No ARP replies, one TCP segment per reply, and the client's data is never decrypted.
 
-## How it holds 64,499 connections
+## How it holds 64,491 connections
 
 - One 128-byte slot per client port, all 65,536 of them, found with a single unaligned load
   from the received frame: slirp (QEMU's user-mode network) shows every client as 10.0.2.2,
@@ -68,7 +68,7 @@ Change `www/index.html` to serve something else.
 - Anything that isn't the next expected byte is just acknowledged again, so slirp's resends
   recover from the NE2000's receive ring, which overflows whenever handshakes queue up.
 - The ceiling is the client: ~64,510 is every unprivileged port on 127.0.0.1 (minus those in
-  use); 10 of those page fetches timed out. Beyond ~10K connections, slirp's main loop, which
+  use); 7 to 18 of those page fetches time out, depending on the run. Beyond ~10K connections, slirp's main loop, which
   walks all its sockets on every iteration (~0.5 s at 64K), is the bottleneck, not the guest.
 
 `CLAUDE.md` lists every shortcut and the machine contract. `src/os.c` is an earlier C
