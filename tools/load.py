@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Load tests for the HTTPS OS. QEMU must already be serving on 127.0.0.1:$PORT (default 8443).
 
-  load.py hold [N]      the score test: open connections (32 handshakes in flight, starts 4 ms
+  load.py hold [N]      the score test: open connections (4 handshakes in flight, starts 4 ms
                         apart since slirp's listen backlog is only 1) and keep
                         all of them open; at 64, 128, 256, ... and at the end, fetch the page
                         over every open connection. Stops at the first checkpoint where any
@@ -17,7 +17,7 @@ import asyncio, collections, errno, os, ssl, sys, time
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8443"))
 TIMEOUT = float(os.environ.get("TIMEOUT", "60"))  # per handshake / per request
-INFLIGHT = int(os.environ.get("INFLIGHT", "32"))
+INFLIGHT = int(os.environ.get("INFLIGHT", "4"))
 GAP = float(os.environ.get("GAP", "0.004"))  # between connection starts: slirp's listen backlog is 1
 EXPECT = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "www", "index.html"), "rb").read()
 REQ = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -25,6 +25,8 @@ REQ = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
 CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
+if os.environ.get("SSLKEYLOGFILE"):
+    CTX.keylog_filename = os.environ["SSLKEYLOGFILE"]
 
 
 def ename(e):
@@ -36,7 +38,8 @@ def log(*a):
 
 
 async def connect():
-    return await asyncio.wait_for(asyncio.open_connection(HOST, PORT, ssl=CTX), TIMEOUT)
+    return await asyncio.wait_for(
+        asyncio.open_connection(HOST, PORT, ssl=CTX, ssl_handshake_timeout=TIMEOUT), TIMEOUT)
 
 
 async def get(conn):

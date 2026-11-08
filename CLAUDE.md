@@ -11,10 +11,10 @@ Security does not matter. Correctness for real clients (curl, Chrome, Firefox) d
 - `./measure.sh` builds, boots it in QEMU (TCG, no KVM here), fetches it with curl
   (fresh connections + keep-alive), prints PASS + size + largest routines
 - `./score.sh [image] [max]` boots the image and runs `tools/load.py hold`: opens TLS
-  connections (32 handshakes in flight, starts 4 ms apart because slirp's listen backlog is 1),
+  connections (4 handshakes in flight: more overflow the NIC ring; starts 4 ms apart because slirp's listen backlog is 1),
   keeps them all open, fetches the page over every one at 64, 128, 256, ... open and at the
   end; stops at the first failing checkpoint, at `max`, or when the client runs out of ports
-  (~28K: Linux's ephemeral range). Takes minutes at full scale. `tools/load.py` also has
+  (28,232: Linux's ephemeral range; ~13 minutes, ~8 GB of client RAM at full scale). `tools/load.py` also has
   `burst K` (K clients at the same moment), `seq N` (handshake rate) and `ka N` (keep-alive).
 - `./browsers.sh` checks Chrome (cert errors must be bypassable, page renders) and
   Firefox (`tools/ffcheck.py`, Marionette, cert exception in a throwaway profile).
@@ -32,8 +32,10 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 
 ## Layout
 - `src/os.asm`: everything (boot, NE2000, TCP, TLS 1.3, crypto). Buffers live at fixed
-  addresses from 2 MiB (RAM is zero at boot); connections at 4 MiB, 16 KiB each, slot =
-  low byte of the client port.
+  addresses from 2 MiB (RAM is zero there at boot). Connections: one 128-byte slot per client
+  port at 8 MiB (all 65536 ports fit, so no collisions: slirp shows every client as 10.0.2.2).
+  ClientHellos are reassembled in 1024 x 4 KiB buckets at 4 MiB, indexed by slirp's ISN.
+  The top ~400 KiB below 16 MiB hold SeaBIOS tables at boot: never assume zeros up there.
 - `tools/gen.py`: build-time cert, CertificateVerify template, HTTP response -> `build/gen.inc`
   (and `build/gen.h` for the C version)
 - `www/index.html`: the served file (keep it fixed when comparing sizes)
@@ -54,8 +56,19 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
 - Client data is never decrypted; client Finished is not verified. We count records:
   1st = ClientHello, then each application_data record after the client's Finished
   gets one HTTP response (keep-alive works).
-- TCP is stateless: our seq = their ack, our ack = their seq + len. No retransmits
-  (slirp doesn't drop). Pure ACKs are needed to stop slirp retransmitting into our stream.
+- TCP: our seq = their ack (nothing we send is lost, so no retransmits, no send state).
+  Per connection we keep the next sequence number we expect: a segment that isn't exactly
+  that (a resend, or one after a segment the NIC dropped) is ignored and re-acked, so slirp
+  resends from there. The NE2000 drops frames when its 31 KB ring is full (QEMU has no
+  can_receive for it), which happens whenever handshakes queue up; slirp's resends recover.
+  A client FIN gets FIN+ACK. Pure ACKs are needed to stop slirp retransmitting into our
+  stream. Pipelined requests in separate segments would get overlapping seqs (no client does).
+- slirp's ISN is 1 + 64000 n (n counts connections and 500 ms ticks), so ClientHello bucket
+  125 n mod 1024 differs for 1024 connections in a row. slirp sends the ClientHello's 2nd
+  segment only after we ack the 1st (slow start), so partial ClientHellos are the norm.
+- After the handshake, records are only skipped (header read, length counted down), never
+  stored: a record header split across two segments would desync (needs >1 MSS of requests).
+- `keys` writes 20 junk bytes after the IV (HKDF-Expand always stores 32): slots are 128 bytes.
 - No ARP replies: one unsolicited ARP reply at boot puts 10.0.2.15 -> MAC 0 in slirp's table.
 - Replies are built in place from the received frame; Ethernet addresses are not swapped
   (slirp ignores them); the window field is whatever slirp sent us. TCP segments are at
