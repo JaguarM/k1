@@ -95,8 +95,9 @@ Default CPU (qemu64: has SSE3, which `fisttp` needs). NIC: ISA NE2000 at port 0x
   are read too.
 - No stack setup: QEMU's multiboot loader leaves esp = 0x6f10.
 - Multiboot bss_end covers the 31 zero bytes after the base point 9 (PUB must stay last).
-- Cert (127 bytes): X.509 v1, no extensions, compressed EC point, and no signature (an empty
-  BIT STRING, under the "algorithm" OID 2.5.4). The issuer name (one attribute: OID 2.5.4 = "";
+- Cert (125 bytes): X.509 v1, no extensions, compressed EC point, and no signature (an empty
+  BIT STRING, under the "algorithm" OID 2.5: 1 byte is fine there, 0 bytes breaks curl and
+  Firefox; an empty RDN set as the issuer breaks Chrome and Firefox). The issuer name (one attribute: OID 2.5.4 = "";
   Firefox calls a 1-byte OID such as 2.5 bad DER, not overridable) differs from the empty subject,
   so it is not self-signed: clients look for the issuer, don't find it, and never check the
   signature. Chrome: AUTHORITY_INVALID + COMMON_NAME_INVALID, both bypassable; Firefox:

@@ -28,9 +28,10 @@ def make_cert(key):
     checking the signature, which is therefore an empty BIT STRING. (With issuer == subject,
     Firefox verified the self-signature and refused a dummy one as nssBadCert.)
     """
-    # Nobody checks the signature, so its algorithm needn't be one: the shortest OID that
-    # Firefox parses (2.5.4) instead of ecdsa-with-SHA256 saves 6 bytes in each of 2 places.
-    sigalg = tlv(0x30, tlv(0x06, b"\x55\x04"))
+    # Nobody checks the signature, so its algorithm needn't be one: a 1-byte OID (2.5) instead
+    # of ecdsa-with-SHA256 saves 7 bytes in each of 2 places. (An empty OID breaks curl and
+    # Firefox; in names Firefox wants >= 2 bytes, see the issuer.)
+    sigalg = tlv(0x30, tlv(0x06, b"\x55"))
     # Compressed point (33 bytes instead of 65): curl, Chrome and Firefox all accept it.
     algid = tlv(0x30, tlv(0x06, bytes.fromhex("2a8648ce3d0201")) + tlv(0x06, bytes.fromhex("2a8648ce3d030107")))
     point = key.public_key().public_bytes(serialization.Encoding.X962,
